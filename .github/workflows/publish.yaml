@@ -1,0 +1,75 @@
+name: Test and publish ML-DSA Traefik
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '43 4 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: publish-main
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    if: github.repository == 'Enucatl/traefik' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+      packages: write
+    env:
+      IMAGE: ghcr.io/enucatl/traefik
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+      - name: Rebase on upstream
+        if: github.event_name == 'schedule'
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git remote add upstream https://github.com/traefik/traefik.git
+          git fetch upstream v3.7
+          git rebase upstream/v3.7
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version-file: '.go-version'
+          check-latest: true
+      - name: Enable required Go toolchain downloads
+        run: echo 'GOTOOLCHAIN=auto' >> "$GITHUB_ENV"
+      - name: Identify image revision
+        run: echo "REVISION=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+      - name: Build binary and dashboard
+        run: make binary-linux-amd64 VERSION="$REVISION"
+      - name: Run unit tests
+        run: make test-unit
+      - name: Run HTTPS integration tests
+        run: make test-integration TESTFLAGS='-run TestHTTPSSuite'
+      - name: Build image
+        run: |
+          docker build --pull --build-arg TARGETPLATFORM=linux/amd64 \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.revision=$REVISION" \
+            -t "$IMAGE:latest" .
+      - name: Check image compiler
+        run: |
+          docker run --rm "$IMAGE:latest" version | tee /tmp/traefik-version
+          go_version=$(sed -n 's/^Go version: *go//p' /tmp/traefik-version)
+          printf '%s\n' '1.27.3' "$go_version" | sort --version-sort --check
+      - name: Update main after successful tests
+        if: github.event_name == 'schedule'
+        env:
+          ORIGINAL_REVISION: ${{ github.sha }}
+        run: git push --force-with-lease="refs/heads/main:$ORIGINAL_REVISION" origin HEAD:main
+      - name: Log in to GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+      - name: Publish verified image
+        run: docker push "$IMAGE:latest"
